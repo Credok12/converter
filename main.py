@@ -9,15 +9,19 @@ from bs4 import BeautifulSoup
 
 app = FastAPI(title="PDF to EPUB Converter")
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+
 # Create static directory if it doesn't exist
-os.makedirs("static", exist_ok=True)
+os.makedirs(STATIC_DIR, exist_ok=True)
 
 # Mount static files
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 @app.get("/", response_class=HTMLResponse)
 async def read_index():
-    with open("static/index.html", "r", encoding="utf-8") as f:
+    index_path = os.path.join(STATIC_DIR, "index.html")
+    with open(index_path, "r", encoding="utf-8") as f:
         return f.read()
 
 @app.post("/convert")
