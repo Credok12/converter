@@ -41,60 +41,140 @@ async def convert_pdf(file: UploadFile = File(...)):
         book.set_language('fr')
         book.add_author('Convertisseur PDF vers EPUB')
         
-        chapters = []
-        
-        # Process each page
+        # Phase 1: Collect all text and image blocks sequentially
+        all_blocks = []
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
-            
-            # HTML string for the chapter
-            html_content = ""
-            
-            # Extract text blocks
             blocks = page.get_text("dict")["blocks"]
-            import re
-            
             for block in blocks:
-                if block['type'] == 0:  # Text block
-                    text_content = ""
-                    for line in block["lines"]:
-                        for span in line["spans"]:
-                            text_content += span["text"] + " "
-                            
-                    clean_text = text_content.strip()
-                    # Ignorer les blocs qui ne contiennent qu'un numéro de page (ex: "33", "- 33 -", "– 33 –")
-                    if re.fullmatch(r'[-–—]?\s*\d+\s*[-–—]?', clean_text):
-                        continue
-                        
-                    # Clean up with BeautifulSoup to ensure valid XML
-                    soup = BeautifulSoup(f"<p>{clean_text}</p>", "html.parser")
-                    html_content += str(soup) + "\n"
+                block["page_num"] = page_num
+                all_blocks.append(block)
+
+        # Phase 2: Compute base font size
+        font_sizes = []
+        for block in all_blocks:
+            if block['type'] == 0:
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        font_sizes.append(span["size"])
+        
+        # Using statistics mode to find the most common font size
+        import statistics
+        try:
+            base_size = statistics.mode([round(size) for size in font_sizes])
+        except statistics.StatisticsError:
+            base_size = 11 # Default fallback
+
+        # Phase 3: Group into logical chapters and merge paragraphs
+        logical_chapters = []
+        current_chapter_title = "Début"
+        current_chapter_blocks = []
+        
+        import re
+        pending_text = ""
+        
+        for block in all_blocks:
+            if block['type'] == 0:  # Text block
+                block_text = ""
+                max_size = 0
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        block_text += span["text"] + " "
+                        if span["size"] > max_size:
+                            max_size = span["size"]
                 
-                elif block['type'] == 1:  # Image block
-                    # Extract image
-                    try:
-                        base_image = doc.extract_image(block["number"])
-                        if base_image:
-                            image_bytes = base_image["image"]
-                            image_ext = base_image["ext"]
-                            image_name = f"image_{page_num}_{block['number']}.{image_ext}"
-                            
-                            # Add image to epub
-                            epub_img = epub.EpubItem(
-                                uid=image_name,
-                                file_name=f"images/{image_name}",
-                                media_type=f"image/{image_ext}",
-                                content=image_bytes
-                            )
-                            book.add_item(epub_img)
-                            
-                            # Add img tag to html
-                            html_content += f'<div style="text-align:center; margin: 1em 0;"><img src="images/{image_name}" alt="Image page {page_num+1}" style="max-width:100%;"/></div>\n'
-                    except Exception as e:
-                        print(f"Failed to extract image: {e}")
+                clean_text = block_text.strip()
+                
+                # Ignorer les blocs qui ne contiennent qu'un numéro de page
+                if re.fullmatch(r'[-–—]?\s*\d+\s*[-–—]?', clean_text) or not clean_text:
+                    continue
+                    
+                # Is it a title? (Significantly larger than base font, short text)
+                if max_size > base_size * 1.15 and len(clean_text) < 150:
+                    # Flush pending text if any
+                    if pending_text:
+                        current_chapter_blocks.append({"type": "text", "content": pending_text})
+                        pending_text = ""
+                        
+                    # Save current chapter if it has content
+                    if current_chapter_blocks:
+                        logical_chapters.append({"title": current_chapter_title, "blocks": current_chapter_blocks})
+                        
+                    # Start new chapter
+                    current_chapter_title = clean_text
+                    current_chapter_blocks = []
+                    current_chapter_blocks.append({"type": "title", "content": clean_text})
+                
+                else:
+                    # Normal text - logic to merge with pending
+                    if pending_text:
+                        # Si le texte en attente ne se termine pas par une ponctuation forte 
+                        # et que le nouveau bloc commence par une minuscule
+                        if not re.search(r'[.!?:]\s*$', pending_text) and clean_text and clean_text[0].islower():
+                            pending_text += " " + clean_text
+                        else:
+                            current_chapter_blocks.append({"type": "text", "content": pending_text})
+                            pending_text = clean_text
+                    else:
+                        pending_text = clean_text
+
+            elif block['type'] == 1:  # Image block
+                # Flush pending text before image
+                if pending_text:
+                    current_chapter_blocks.append({"type": "text", "content": pending_text})
+                    pending_text = ""
+                
+                try:
+                    base_image = doc.extract_image(block["number"])
+                    if base_image:
+                        current_chapter_blocks.append({
+                            "type": "image",
+                            "image_bytes": base_image["image"],
+                            "ext": base_image["ext"],
+                            "page_num": block["page_num"],
+                            "block_num": block["number"]
+                        })
+                except Exception as e:
+                    print(f"Failed to extract image: {e}")
+
+        # Flush any remaining text
+        if pending_text:
+            current_chapter_blocks.append({"type": "text", "content": pending_text})
             
-            # Create chapter
-            c = epub.EpubHtml(title=f"Page {page_num + 1}", file_name=f"page_{page_num + 1}.xhtml", lang='fr')
+        if current_chapter_blocks:
+            logical_chapters.append({"title": current_chapter_title, "blocks": current_chapter_blocks})
+            
+        # Phase 4: Create EPUB Chapters
+        chapters = []
+        for i, chapter_data in enumerate(logical_chapters):
+            c_title = chapter_data["title"]
+            c_file_name = f"chapter_{i}.xhtml"
+            c = epub.EpubHtml(title=c_title, file_name=c_file_name, lang='fr')
+            
+            html_content = ""
+            for item in chapter_data["blocks"]:
+                if item["type"] == "title":
+                    soup = BeautifulSoup(f"<h2>{item['content']}</h2>", "html.parser")
+                    html_content += str(soup) + "\n"
+                elif item["type"] == "text":
+                    soup = BeautifulSoup(f"<p>{item['content']}</p>", "html.parser")
+                    html_content += str(soup) + "\n"
+                elif item["type"] == "image":
+                    img_name = f"image_{item['page_num']}_{item['block_num']}.{item['ext']}"
+                    
+                    try:
+                        epub_img = epub.EpubItem(
+                            uid=img_name,
+                            file_name=f"images/{img_name}",
+                            media_type=f"image/{item['ext']}",
+                            content=item["image_bytes"]
+                        )
+                        book.add_item(epub_img)
+                    except ValueError:
+                        pass
+                        
+                    html_content += f'<div style="text-align:center; margin: 1em 0;"><img src="images/{img_name}" alt="Image" style="max-width:100%;"/></div>\n'
+            
             c.content = html_content
             book.add_item(c)
             chapters.append(c)
